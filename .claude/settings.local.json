@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "Bash(echo $ANTHROPIC_MODEL)",
+      "Bash(env)",
+      "Bash(ffmpeg:*)",
+      "Bash(ffprobe:*)",
+      "Bash(python create_metadata.py:*)",
+      "Bash(python generate_embeddings.py:*)",
+      "Bash(python search_test.py:*)",
+      "Bash(git config:*)",
+      "Bash(git init:*)",
+      "Bash(git add:*)"
+    ]
+  }
+}

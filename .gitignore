@@ -1,0 +1,28 @@
+# Video files
+*.mp4
+*.avi
+*.mkv
+*.mov
+
+# Output data (large files)
+output/frames/
+output/embeddings.npz
+output/frame_log.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test folders
+test_scene/
