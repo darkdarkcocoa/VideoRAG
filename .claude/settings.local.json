@@ -19,7 +19,8 @@
       "Bash(dir:*)",
       "Bash(pip show:*)",
       "Bash(python app.py:*)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(git remote:*)"
     ]
   }
 }
