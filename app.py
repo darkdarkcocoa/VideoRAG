@@ -1,4 +1,4 @@
-"""VideoRAG Search GUI - Gradio App"""
+"""SceneSearch - Gradio Web UI"""
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -27,7 +27,7 @@ def load_resources():
     """Load embeddings, metadata, and CLIP model"""
     global embeddings, frames, model, tokenizer, device
 
-    print("[*] Loading VideoRAG Search...")
+    print("[*] Loading SceneSearch...")
 
     # Load embeddings
     data = np.load(EMBEDDINGS_FILE)
@@ -103,7 +103,7 @@ def create_app():
     """
 
     with gr.Blocks(
-        title="VideoRAG Search",
+        title="SceneSearch",
         theme=gr.themes.Soft(
             primary_hue="blue",
             secondary_hue="slate",
@@ -113,8 +113,8 @@ def create_app():
         # Header
         gr.Markdown(
             """
-            # 🎬 VideoRAG Search
-            ### Transcendence 영화에서 장면을 검색하세요
+            # 🎬 SceneSearch
+            ### 자연어로 영상 속 장면을 검색하세요
             """
         )
 

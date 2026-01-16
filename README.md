@@ -1,4 +1,4 @@
-# 🎬 VideoRAG
+# 🎬 SceneSearch
 
 **Video Semantic Search** - 자연어로 영상 속 장면을 검색하세요!
 
@@ -30,8 +30,8 @@
 ### Setup
 ```bash
 # Clone repository
-git clone https://github.com/darkdarkcocoa/VideoRAG.git
-cd VideoRAG
+git clone https://github.com/darkdarkcocoa/SceneSearch.git
+cd SceneSearch
 
 # Install dependencies
 pip install torch torchvision open-clip-torch opencv-python pillow numpy
@@ -72,13 +72,12 @@ python prototype.py
 ## 📁 Project Structure
 
 ```
-VideoRAG/
+SceneSearch/
+├── app.py                 # Gradio 웹 UI
 ├── prototype.py           # 올인원 프로토타입 (추출 + 임베딩 + 검색)
 ├── create_metadata.py     # ffmpeg 로그 → metadata.json 변환
 ├── generate_embeddings.py # CLIP 임베딩 생성
 ├── search_test.py         # 검색 테스트 스크립트
-├── check_video.py         # 비디오 정보 확인 유틸
-├── download_model.py      # CLIP 모델 다운로드 테스트
 └── output/
     ├── frames/            # 추출된 프레임 이미지
     ├── metadata.json      # 프레임 타임스탬프 정보

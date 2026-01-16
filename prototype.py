@@ -158,7 +158,7 @@ def format_time(seconds):
 # ============================================================
 def main():
     print("=" * 60)
-    print("Video Semantic Search Prototype")
+    print("SceneSearch - Video Semantic Search")
     print("=" * 60)
     
     # Setup device
