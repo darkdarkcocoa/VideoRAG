@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import open_clip
 import json
+import time
 from pathlib import Path
 
 # Paths
@@ -55,18 +56,22 @@ def load_resources():
 def search(query: str, top_k: int = 8):
     """Search for frames matching the query"""
     if not query.strip():
-        return []
+        return [], ""
 
-    # Encode query
+    # 1. Encode query (CLIP text encoding)
+    t0 = time.perf_counter()
     text_tokens = tokenizer([query])
     with torch.no_grad():
         text_emb = model.encode_text(text_tokens.to(device))
         text_emb /= text_emb.norm(dim=-1, keepdim=True)
     text_emb = text_emb.cpu().numpy().flatten()
+    encode_time = time.perf_counter() - t0
 
-    # Calculate similarities
+    # 2. Vector search (cosine similarity)
+    t1 = time.perf_counter()
     similarities = embeddings @ text_emb
     top_indices = np.argsort(similarities)[::-1][:top_k]
+    search_time = time.perf_counter() - t1
 
     # Build results
     results = []
@@ -80,7 +85,9 @@ def search(query: str, top_k: int = 8):
             caption = f"⏱️ {frame['time_str']} | Score: {score:.3f}"
             results.append((str(image_path), caption))
 
-    return results
+    time_info = f"🔎 {len(frames):,}개 프레임 | 인코딩: {encode_time*1000:.1f}ms | 검색: {search_time*1000:.2f}ms"
+
+    return results, time_info
 
 def create_app():
     """Create Gradio app"""
@@ -137,6 +144,9 @@ def create_app():
 
         search_btn = gr.Button("🔍 검색", variant="primary", size="lg")
 
+        # Search time info
+        search_info = gr.Markdown("")
+
         # Results gallery
         gallery = gr.Gallery(
             label="검색 결과",
@@ -169,13 +179,13 @@ def create_app():
         search_btn.click(
             fn=search,
             inputs=[query_input, top_k_slider],
-            outputs=gallery
+            outputs=[gallery, search_info]
         )
 
         query_input.submit(
             fn=search,
             inputs=[query_input, top_k_slider],
-            outputs=gallery
+            outputs=[gallery, search_info]
         )
 
         # Footer info
