@@ -1,4 +1,4 @@
-"""SceneSearch - Gradio Web UI"""
+"""SceneSearch - Gradio Web UI (Hybrid Search with BLIP Captions)"""
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -18,28 +18,48 @@ METADATA_FILE = OUTPUT_DIR / "metadata.json"
 FRAMES_DIR = OUTPUT_DIR / "frames"
 
 # Global variables
-embeddings = None
+image_embeddings = None
+text_embeddings = None
 frames = None
 model = None
 tokenizer = None
 device = None
+use_hybrid = False  # Will be set based on available data
 
 def load_resources():
     """Load embeddings, metadata, and CLIP model"""
-    global embeddings, frames, model, tokenizer, device
+    global image_embeddings, text_embeddings, frames, model, tokenizer, device, use_hybrid
 
     print("[*] Loading SceneSearch...")
 
     # Load embeddings
     data = np.load(EMBEDDINGS_FILE)
-    embeddings = data['embeddings']
+    
+    # Check if hybrid embeddings exist (new format)
+    if 'image_embeddings' in data:
+        image_embeddings = data['image_embeddings']
+        text_embeddings = data['text_embeddings']
+        use_hybrid = True
+        print(f"[+] Loaded hybrid embeddings (image + text)")
+    else:
+        # Fallback to old format
+        image_embeddings = data['embeddings']
+        text_embeddings = None
+        use_hybrid = False
+        print(f"[+] Loaded image embeddings only (legacy mode)")
 
     # Load metadata
     with open(METADATA_FILE, 'r', encoding='utf-8') as f:
         metadata = json.load(f)
     frames = metadata['frames']
 
-    print(f"[+] Loaded {len(frames)} frame embeddings")
+    print(f"[+] Loaded {len(frames)} frames")
+    
+    # Check if captions exist
+    if 'caption' in frames[0]:
+        print(f"[+] Captions available")
+    else:
+        print(f"[!] No captions found (run generate_embeddings.py to add)")
 
     # Load CLIP model
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -53,23 +73,44 @@ def load_resources():
     print("[+] CLIP model loaded")
     print("[!] Ready!\n")
 
-def search(query: str, top_k: int = 8):
-    """Search for frames matching the query"""
+def search(query: str, top_k: int = 8, image_weight: float = 0.6):
+    """Hybrid search for frames matching the query"""
     if not query.strip():
         return [], ""
 
-    # 1. Encode query (CLIP text encoding)
+    # 1. Encode query
     t0 = time.perf_counter()
     text_tokens = tokenizer([query])
     with torch.no_grad():
-        text_emb = model.encode_text(text_tokens.to(device))
-        text_emb /= text_emb.norm(dim=-1, keepdim=True)
-    text_emb = text_emb.cpu().numpy().flatten()
+        query_emb = model.encode_text(text_tokens.to(device))
+        query_emb /= query_emb.norm(dim=-1, keepdim=True)
+    query_emb = query_emb.cpu().numpy().flatten()
     encode_time = time.perf_counter() - t0
 
-    # 2. Vector search (cosine similarity)
+    # 2. Calculate similarities
     t1 = time.perf_counter()
-    similarities = embeddings @ text_emb
+    
+    # Image similarity
+    img_similarities = image_embeddings @ query_emb
+    
+    if use_hybrid and text_embeddings is not None:
+        # Text (caption) similarity
+        txt_similarities = text_embeddings @ query_emb
+        
+        # Dynamic weight based on query length
+        word_count = len(query.split())
+        if word_count <= 2:
+            w_img, w_txt = 0.7, 0.3  # Short query → visual focus
+        else:
+            w_img, w_txt = image_weight, 1 - image_weight  # Use slider value
+        
+        # Combined score
+        similarities = img_similarities * w_img + txt_similarities * w_txt
+        search_mode = f"Hybrid (img:{w_img:.1f}, txt:{w_txt:.1f})"
+    else:
+        similarities = img_similarities
+        search_mode = "Image only"
+    
     top_indices = np.argsort(similarities)[::-1][:top_k]
     search_time = time.perf_counter() - t1
 
@@ -81,18 +122,21 @@ def search(query: str, top_k: int = 8):
         image_path = FRAMES_DIR / frame['filename']
 
         if image_path.exists():
-            # Caption with time and score
-            caption = f"⏱️ {frame['time_str']} | Score: {score:.3f}"
+            # Caption with time, score, and BLIP caption
+            caption_text = frame.get('caption', '')
+            if caption_text:
+                caption = f"⏱️ {frame['time_str']} | Score: {score:.3f}\n📝 {caption_text}"
+            else:
+                caption = f"⏱️ {frame['time_str']} | Score: {score:.3f}"
             results.append((str(image_path), caption))
 
-    time_info = f"🔎 {len(frames):,}개 프레임 | 인코딩: {encode_time*1000:.1f}ms | 검색: {search_time*1000:.2f}ms"
+    time_info = f"🔎 {len(frames):,}개 프레임 | {search_mode} | 인코딩: {encode_time*1000:.1f}ms | 검색: {search_time*1000:.2f}ms"
 
     return results, time_info
 
 def create_app():
     """Create Gradio app"""
 
-    # Custom CSS for clean, modern look
     custom_css = """
     .gradio-container {
         max-width: 1200px !important;
@@ -100,9 +144,6 @@ def create_app():
     }
     .search-box {
         font-size: 18px !important;
-    }
-    .gallery-item {
-        border-radius: 12px !important;
     }
     footer {
         display: none !important;
@@ -142,9 +183,20 @@ def create_app():
                     label="결과 개수"
                 )
 
+        # Advanced options (collapsible)
+        with gr.Accordion("🔧 고급 설정", open=False):
+            image_weight_slider = gr.Slider(
+                minimum=0.0,
+                maximum=1.0,
+                value=0.6,
+                step=0.1,
+                label="이미지 가중치 (낮을수록 캡션 중심 검색)",
+                info="짧은 검색어(1-2단어)는 자동으로 이미지 중심(0.7)으로 설정됩니다"
+            )
+
         search_btn = gr.Button("🔍 검색", variant="primary", size="lg")
 
-        # Search time info
+        # Search info
         search_info = gr.Markdown("")
 
         # Results gallery
@@ -154,8 +206,7 @@ def create_app():
             rows=2,
             height="auto",
             object_fit="cover",
-            show_label=True,
-            elem_classes=["gallery-item"]
+            show_label=True
         )
 
         # Example queries
@@ -167,7 +218,7 @@ def create_app():
                 ["laboratory equipment"],
                 ["outdoor garden scene"],
                 ["two people talking"],
-                ["dark moody scene"],
+                ["a man giving presentation"],
                 ["explosion or bright light"],
                 ["woman with long hair"],
             ],
@@ -178,21 +229,22 @@ def create_app():
         # Event handlers
         search_btn.click(
             fn=search,
-            inputs=[query_input, top_k_slider],
+            inputs=[query_input, top_k_slider, image_weight_slider],
             outputs=[gallery, search_info]
         )
 
         query_input.submit(
             fn=search,
-            inputs=[query_input, top_k_slider],
+            inputs=[query_input, top_k_slider, image_weight_slider],
             outputs=[gallery, search_info]
         )
 
-        # Footer info
+        # Footer
+        mode_text = "Hybrid (CLIP + BLIP)" if use_hybrid else "CLIP Only"
         gr.Markdown(
-            """
+            f"""
             ---
-            *CLIP ViT-B/32 모델 사용 | Scene Detection으로 추출된 1,125개 프레임*
+            *{mode_text} | {len(frames) if frames else 0:,}개 프레임*
             """
         )
 

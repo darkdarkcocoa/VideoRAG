@@ -1,4 +1,4 @@
-"""Search test for Transcendence movie"""
+"""Search test for Transcendence movie (Hybrid Search)"""
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -15,7 +15,18 @@ METADATA_FILE = OUTPUT_DIR / "metadata.json"
 
 # Load embeddings
 data = np.load(EMBEDDINGS_FILE)
-embeddings = data['embeddings']
+
+# Check for hybrid or legacy format
+if 'image_embeddings' in data:
+    image_embeddings = data['image_embeddings']
+    text_embeddings = data['text_embeddings']
+    use_hybrid = True
+    print("Mode: Hybrid (image + caption)")
+else:
+    image_embeddings = data['embeddings']
+    text_embeddings = None
+    use_hybrid = False
+    print("Mode: Image only (legacy)")
 
 # Load metadata
 with open(METADATA_FILE, 'r', encoding='utf-8') as f:
@@ -32,24 +43,43 @@ model.eval()
 tokenizer = open_clip.get_tokenizer('ViT-B-32')
 
 def search(query, top_k=5):
+    # Encode query
     text_tokens = tokenizer([query])
     with torch.no_grad():
-        text_emb = model.encode_text(text_tokens.to(device))
-        text_emb /= text_emb.norm(dim=-1, keepdim=True)
-    text_emb = text_emb.cpu().numpy().flatten()
+        query_emb = model.encode_text(text_tokens.to(device))
+        query_emb /= query_emb.norm(dim=-1, keepdim=True)
+    query_emb = query_emb.cpu().numpy().flatten()
 
-    similarities = embeddings @ text_emb
+    # Calculate similarities
+    img_sim = image_embeddings @ query_emb
+    
+    if use_hybrid and text_embeddings is not None:
+        txt_sim = text_embeddings @ query_emb
+        
+        # Dynamic weight based on query length
+        if len(query.split()) <= 2:
+            w_img, w_txt = 0.7, 0.3
+        else:
+            w_img, w_txt = 0.5, 0.5
+        
+        similarities = img_sim * w_img + txt_sim * w_txt
+    else:
+        similarities = img_sim
+
     top_indices = np.argsort(similarities)[::-1][:top_k]
 
-    print(f"\n{'='*50}")
+    print(f"\n{'='*60}")
     print(f"Query: '{query}'")
-    print(f"{'='*50}")
+    print(f"{'='*60}")
     for i, idx in enumerate(top_indices, 1):
         frame = frames[idx]
         sim = similarities[idx]
+        caption = frame.get('caption', 'N/A')
         print(f"  {i}. [{frame['time_str']}] {frame['filename']} (score: {sim:.3f})")
+        if caption != 'N/A':
+            print(f"      📝 {caption[:70]}...")
 
-# Test searches - Transcendence related
+# Test searches
 test_queries = [
     "Johnny Depp face",
     "computer screen",
@@ -64,7 +94,7 @@ test_queries = [
 ]
 
 print("\n" + "=" * 60)
-print("TRANSCENDENCE SEARCH TEST")
+print("TRANSCENDENCE SEARCH TEST (HYBRID)")
 print("=" * 60)
 
 for q in test_queries:
