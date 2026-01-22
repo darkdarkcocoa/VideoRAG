@@ -26,7 +26,8 @@
       "Bash(ping:*)",
       "Bash(netstat:*)",
       "Bash(tasklist:*)",
-      "Bash(taskkill //F //PID 6308)"
+      "Bash(taskkill //F //PID 6308)",
+      "Bash(git stash:*)"
     ]
   }
 }
