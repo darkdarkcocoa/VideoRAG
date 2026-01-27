@@ -27,7 +27,13 @@
       "Bash(netstat:*)",
       "Bash(tasklist:*)",
       "Bash(taskkill //F //PID 6308)",
-      "Bash(git stash:*)"
+      "Bash(git stash:*)",
+      "Bash(git checkout:*)",
+      "mcp__context7__resolve-library-id",
+      "mcp__context7__query-docs",
+      "Bash(findstr:*)",
+      "Bash(taskkill:*)",
+      "Bash(cmd //c \"taskkill /PID 11272 /F\")"
     ]
   }
 }

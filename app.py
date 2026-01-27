@@ -1,4 +1,4 @@
-"""SceneSearch - Gradio Web UI (Refined & Aesthetic) """
+"""SceneSearch - Gradio Web UI with Video Player Integration"""
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -17,10 +17,8 @@ from PIL import Image
 
 # Paths
 BASE_DIR = Path(__file__).parent
+VIDEO_DIR = BASE_DIR / "video"
 OUTPUT_DIR = BASE_DIR / "output"
-EMBEDDINGS_FILE = OUTPUT_DIR / "embeddings.npz"
-METADATA_FILE = OUTPUT_DIR / "metadata.json"
-FRAMES_DIR = OUTPUT_DIR / "frames"
 
 # Global variables
 image_embeddings = None
@@ -30,10 +28,12 @@ clip_model = None
 tokenizer = None
 device = None
 use_hybrid = False
+current_movie = None  # Currently loaded movie name
+search_results_timestamps = []  # Store timestamps for gallery clicks
 
-# ============================================================ 
+# ============================================================
 # UTILS
-# ============================================================ 
+# ============================================================
 def format_time(seconds):
     """Format seconds to HH:MM:SS"""
     h = int(seconds // 3600)
@@ -46,47 +46,58 @@ def format_time(seconds):
 def get_device():
     return "cuda" if torch.cuda.is_available() else "cpu"
 
-# ============================================================ 
+def get_movie_name(video_path):
+    """Extract movie name from path (without extension)"""
+    return Path(video_path).stem
+
+def get_available_movies():
+    """Get list of video files in video/ folder"""
+    if not VIDEO_DIR.exists():
+        VIDEO_DIR.mkdir(parents=True, exist_ok=True)
+        return []
+
+    video_extensions = {'.mp4', '.avi', '.mkv', '.mov', '.wmv', '.webm'}
+    movies = []
+    for f in VIDEO_DIR.iterdir():
+        if f.is_file() and f.suffix.lower() in video_extensions:
+            movies.append(f.stem)
+    return sorted(movies)
+
+def get_movie_paths(movie_name):
+    """Get all paths for a movie"""
+    video_path = VIDEO_DIR / f"{movie_name}.mp4"
+    # Try other extensions if mp4 doesn't exist
+    if not video_path.exists():
+        for ext in ['.avi', '.mkv', '.mov', '.wmv', '.webm']:
+            alt_path = VIDEO_DIR / f"{movie_name}{ext}"
+            if alt_path.exists():
+                video_path = alt_path
+                break
+
+    movie_output_dir = OUTPUT_DIR / movie_name
+    return {
+        'video': video_path,
+        'output_dir': movie_output_dir,
+        'embeddings': movie_output_dir / 'embeddings.npz',
+        'metadata': movie_output_dir / 'metadata.json',
+        'frames': movie_output_dir / 'frames'
+    }
+
+def is_movie_processed(movie_name):
+    """Check if a movie has been processed (embeddings exist)"""
+    paths = get_movie_paths(movie_name)
+    return paths['embeddings'].exists() and paths['metadata'].exists()
+
+# ============================================================
 # SEARCH ENGINE
-# ============================================================ 
-def load_resources():
-    """Load embeddings, metadata, and CLIP model"""
-    global image_embeddings, text_embeddings, frames, clip_model, tokenizer, device, use_hybrid
+# ============================================================
+def load_clip_model():
+    """Load CLIP model (only once)"""
+    global clip_model, tokenizer, device
 
-    print("[*] Loading SceneSearch...")
+    if clip_model is not None:
+        return True
 
-    if not EMBEDDINGS_FILE.exists():
-        print("[!] No embeddings found. Please process a video first.")
-        return False
-
-    # Load Embeddings
-    try:
-        data = np.load(EMBEDDINGS_FILE)
-        if 'image_embeddings' in data:
-            image_embeddings = data['image_embeddings']
-            text_embeddings = data['text_embeddings']
-            use_hybrid = True
-            print(f"[+] Loaded hybrid embeddings (Image + Text)")
-        else:
-            image_embeddings = data['embeddings']
-            text_embeddings = None
-            use_hybrid = False
-            print(f"[+] Loaded legacy embeddings (Image Only)")
-    except Exception as e:
-        print(f"[!] Error loading embeddings: {e}")
-        return False
-
-    # Load Metadata
-    try:
-        with open(METADATA_FILE, 'r', encoding='utf-8') as f:
-            metadata = json.load(f)
-        frames = metadata['frames']
-        print(f"[+] Loaded {len(frames)} frames")
-    except Exception as e:
-        print(f"[!] Error loading metadata: {e}")
-        return False
-
-    # Load Model
     device = get_device()
     print(f"[+] Using device: {device}")
 
@@ -96,25 +107,72 @@ def load_resources():
         clip_model.eval()
         tokenizer = open_clip.get_tokenizer('ViT-B-32')
         print("[+] CLIP model loaded")
+        return True
     except Exception as e:
         print(f"[!] Error loading CLIP model: {e}")
         return False
 
+
+def load_movie_data(movie_name):
+    """Load embeddings and metadata for a specific movie"""
+    global image_embeddings, text_embeddings, frames, use_hybrid, current_movie
+
+    if not movie_name:
+        return False, "No movie selected"
+
+    paths = get_movie_paths(movie_name)
+
+    if not paths['embeddings'].exists():
+        return False, f"Movie '{movie_name}' has not been processed yet"
+
+    # Load Embeddings
+    try:
+        data = np.load(paths['embeddings'])
+        if 'image_embeddings' in data:
+            image_embeddings = data['image_embeddings']
+            text_embeddings = data['text_embeddings']
+            use_hybrid = True
+        else:
+            image_embeddings = data['embeddings']
+            text_embeddings = None
+            use_hybrid = False
+    except Exception as e:
+        return False, f"Error loading embeddings: {e}"
+
+    # Load Metadata
+    try:
+        with open(paths['metadata'], 'r', encoding='utf-8') as f:
+            metadata = json.load(f)
+        frames = metadata['frames']
+    except Exception as e:
+        return False, f"Error loading metadata: {e}"
+
+    current_movie = movie_name
+    print(f"[+] Loaded '{movie_name}': {len(frames)} frames")
+    return True, f"Loaded {len(frames)} frames"
+
+
+def load_resources():
+    """Initialize - load CLIP model"""
+    print("[*] Loading SceneSearch...")
+    load_clip_model()
     print("[!] Ready!\n")
-    return True
 
 def search(query: str, top_k: int, search_mode: str):
     """
     Hybrid search logic
     search_mode: "Visual (Image)", "Hybrid (Smart)", "Conceptual (Text)"
+    Returns: (gallery_results, stats_html, timestamps_list)
     """
-    global image_embeddings, text_embeddings, frames, use_hybrid
-    
+    global image_embeddings, text_embeddings, frames, use_hybrid, search_results_timestamps
+
     if image_embeddings is None or frames is None:
-        return [], "⚠️ 먼저 '영상 처리' 탭에서 영상을 처리해주세요."
+        search_results_timestamps = []
+        return [], "⚠️ 먼저 '영상 처리' 탭에서 영상을 처리해주세요.", []
 
     if not query.strip():
-        return [], ""
+        search_results_timestamps = []
+        return [], "", []
 
     # 1. Encode Query
     t0 = time.perf_counter()
@@ -126,27 +184,24 @@ def search(query: str, top_k: int, search_mode: str):
     encode_time = time.perf_counter() - t0
 
     # 2. Determine Weights based on Mode
-    # Default Hybrid weights
     w_img = 0.6
     w_txt = 0.4
-    
     mode_desc = ""
-    
-    if "Visual" in search_mode:
+
+    if search_mode == "Visual":
         w_img, w_txt = 1.0, 0.0
-        mode_desc = "🖼️ Visual Only"
-    elif "Conceptual" in search_mode:
+        mode_desc = "🖼️ Visual"
+    elif search_mode == "Caption":
         w_img, w_txt = 0.0, 1.0
-        mode_desc = "📝 Caption Only"
-    else: # Hybrid (Smart)
+        mode_desc = "📝 Caption"
+    else:  # Hybrid (Smart)
         if use_hybrid and text_embeddings is not None:
-            # Dynamic weighting for Hybrid
             word_count = len(query.split())
             if word_count <= 2:
-                w_img, w_txt = 0.8, 0.2  # Short query -> Trust CLIP visuals more
+                w_img, w_txt = 0.8, 0.2
                 mode_desc = "⚡ Hybrid (Short Query)"
             else:
-                w_img, w_txt = 0.5, 0.5  # Long query -> Trust BLIP captions equally
+                w_img, w_txt = 0.5, 0.5
                 mode_desc = "🧠 Hybrid (Balanced)"
         else:
             w_img, w_txt = 1.0, 0.0
@@ -154,62 +209,79 @@ def search(query: str, top_k: int, search_mode: str):
 
     # 3. Calculate Similarity
     t1 = time.perf_counter()
-    
-    # Image Similarity
     scores = image_embeddings @ query_emb
-    
-    # Text Similarity (if applicable)
+
     if use_hybrid and text_embeddings is not None and w_txt > 0:
         txt_scores = text_embeddings @ query_emb
         scores = scores * w_img + txt_scores * w_txt
-    
-    # Top K
+
     top_indices = np.argsort(scores)[::-1][:top_k]
     search_time = time.perf_counter() - t1
 
-    # 4. Format Results
+    # 4. Format Results + Collect Timestamps
     results = []
+    timestamps = []
+    paths = get_movie_paths(current_movie)
+    frames_dir = paths['frames']
+
     for idx in top_indices:
         frame = frames[idx]
         score = scores[idx]
-        image_path = FRAMES_DIR / frame['filename']
+        image_path = frames_dir / frame['filename']
 
         if image_path.exists():
             caption_text = frame.get('caption', '')
-            
-            # Smart Caption Display
+            timestamp = frame.get('timestamp', 0)
+            timestamps.append(timestamp)
+
+            # Display caption with click hint
             display_caption = f"⏱️ {frame['time_str']}  |  Score: {score:.3f}"
             if caption_text:
-                # Truncate long captions for cleaner UI
-                short_cap = (caption_text[:75] + '..') if len(caption_text) > 75 else caption_text
+                short_cap = (caption_text[:60] + '..') if len(caption_text) > 60 else caption_text
                 display_caption += f"\n📝 {short_cap}"
-            
+            display_caption += "\n🎯 Click to jump"
+
             results.append((str(image_path), display_caption))
+
+    # Store timestamps globally for gallery click handler
+    search_results_timestamps = timestamps
 
     # Stats Bar
     stats = f"""
     <div style='display: flex; justify-content: center; align-items: center; gap: 3rem; padding: 0.8rem 1.5rem; background: linear-gradient(135deg, #1a1d24 0%, #252a34 100%); border-radius: 12px; font-size: 0.95rem; color: #a0aec0; border: 1px solid #2d3748; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);'>
-        <span>🔎 <strong style="color: #e2e8f0;">{len(frames):,}</strong> Frames Scanned</span>
-        <span>⚙️ Mode: <strong style="color: #667eea;">{mode_desc}</strong></span>
-        <span>⚡ Time: <strong style="color: #48bb78;">{(encode_time + search_time)*1000:.1f}ms</strong></span>
+        <span>🔎 <strong style="color: #e2e8f0;">{len(frames):,}</strong> Frames</span>
+        <span>⚙️ <strong style="color: #667eea;">{mode_desc}</strong></span>
+        <span>⚡ <strong style="color: #48bb78;">{(encode_time + search_time)*1000:.1f}ms</strong></span>
     </div>
     """
 
-    return results, stats
+    return results, stats, timestamps
 
-# ============================================================ 
+
+def on_gallery_select(evt: gr.SelectData, timestamps_state):
+    """Handle gallery image click - return timestamp to seek"""
+    if timestamps_state and evt.index < len(timestamps_state):
+        return timestamps_state[evt.index]
+    return None
+
+# ============================================================
 # PROCESSING ENGINE
-# ============================================================ 
+# ============================================================
 def process_video(video_file, scene_threshold, progress=gr.Progress()):
     """Full pipeline: Extract -> Caption -> Embed"""
-    
+
     if video_file is None:
         yield "❌ 영상 파일을 선택해주세요.", None
         return
-    
-    video_path = video_file
+
+    video_path = Path(video_file)
+    movie_name = video_path.stem
+    paths = get_movie_paths(movie_name)
+    frames_dir = paths['frames']
+    output_dir = paths['output_dir']
+
     log_messages = []
-    
+
     def log(msg):
         timestamp = time.strftime("%H:%M:%S")
         log_messages.append(f"[{timestamp}] {msg}")
@@ -217,23 +289,22 @@ def process_video(video_file, scene_threshold, progress=gr.Progress()):
 
     try:
         # 1. Init
-        yield log("🚀 작업 시작: 환경 초기화 중..."), None
-        if FRAMES_DIR.exists(): shutil.rmtree(FRAMES_DIR)
-        FRAMES_DIR.mkdir(parents=True, exist_ok=True)
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        
+        yield log(f"🚀 Processing: {movie_name}"), None
+        if frames_dir.exists():
+            shutil.rmtree(frames_dir)
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
         # 2. FFmpeg Extraction
-        yield log("🎬 장면 감지 및 프레임 추출 시작 (Threshold: {scene_threshold})"), None
-        frame_log_path = OUTPUT_DIR / "frame_log.txt"
-        
+        yield log(f"🎬 Scene detection (threshold: {scene_threshold})"), None
+
         cmd = [
-            "ffmpeg", "-y", "-i", video_path,
+            "ffmpeg", "-y", "-i", str(video_path),
             "-vf", f"select='gt(scene,{scene_threshold})',showinfo",
             "-vsync", "vfr",
-            str(FRAMES_DIR / "frame_%04d.jpg")
+            str(frames_dir / "frame_%04d.jpg")
         ]
-        
-        # Run ffmpeg
+
         proc = subprocess.Popen(
             cmd, stderr=subprocess.PIPE, universal_newlines=True, encoding='utf-8', errors='replace'
         )
@@ -241,21 +312,22 @@ def process_video(video_file, scene_threshold, progress=gr.Progress()):
         for line in proc.stderr:
             if "pts_time:" in line:
                 match = re.search(r'pts_time:(\d+\.?\d*)', line)
-                if match: pts_times.append(float(match.group(1)))
+                if match:
+                    pts_times.append(float(match.group(1)))
         proc.wait()
-        
-        # Check results
-        frame_files = list(FRAMES_DIR.glob("frame_*.jpg"))
+
+        frame_files = list(frames_dir.glob("frame_*.jpg"))
         if not frame_files:
-            yield log("❌ 프레임 추출 실패. 장면 변화가 감지되지 않았거나 FFmpeg 오류입니다."), None
+            yield log("❌ No frames extracted. Try lowering the threshold."), None
             return
-            
-        yield log(f"✅ 프레임 추출 완료: {len(frame_files)}장"), None
+
+        yield log(f"✅ Extracted {len(frame_files)} frames"), None
 
         # 3. Metadata Structure
         frames_data = []
         for i, pts in enumerate(pts_times):
-            if i >= len(frame_files): break
+            if i >= len(frame_files):
+                break
             frames_data.append({
                 "index": i,
                 "filename": f"frame_{i+1:04d}.jpg",
@@ -264,103 +336,92 @@ def process_video(video_file, scene_threshold, progress=gr.Progress()):
             })
 
         # 4. AI Processing (CLIP + BLIP)
-        yield log("🧠 AI 모델(CLIP + BLIP) 로드 중..."), None
-        
+        yield log("🧠 Loading AI models..."), None
+
         proc_device = get_device()
-        
-        # Load CLIP
+
         c_model, _, preprocess = open_clip.create_model_and_transforms('ViT-B-32', pretrained='openai')
         c_model = c_model.to(proc_device).eval()
         c_tokenizer = open_clip.get_tokenizer('ViT-B-32')
-        
-        # Load BLIP
+
         from transformers import BlipProcessor, BlipForConditionalGeneration
         b_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-large")
         b_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-large").to(proc_device).eval()
-        
-        yield log("✅ 모델 로드 완료. 분석 시작..."), None
-        
+
+        yield log("✅ Models loaded. Analyzing frames..."), None
+
         img_embs = []
         txt_embs = []
-        captions = []
-        
+
         start_time = time.time()
         total = len(frames_data)
-        
+
         for i, frame_info in enumerate(frames_data):
-            # Load Image
-            f_path = FRAMES_DIR / frame_info['filename']
+            f_path = frames_dir / frame_info['filename']
             image = Image.open(f_path).convert('RGB')
-            
+
             # CLIP Image Embedding
             img_in = preprocess(image).unsqueeze(0).to(proc_device)
             with torch.no_grad():
                 ie = c_model.encode_image(img_in)
                 ie /= ie.norm(dim=-1, keepdim=True)
             img_embs.append(ie.cpu().numpy().flatten())
-            
+
             # BLIP Caption
             with torch.no_grad():
                 inputs = b_processor(image, return_tensors="pt").to(proc_device)
                 out = b_model.generate(**inputs, max_new_tokens=50)
                 caption = b_processor.decode(out[0], skip_special_tokens=True)
-            captions.append(caption)
-            frame_info['caption'] = caption # Save to metadata
-            
+            frame_info['caption'] = caption
+
             # CLIP Text Embedding (of Caption)
             txt_in = c_tokenizer([caption])
             with torch.no_grad():
                 te = c_model.encode_text(txt_in.to(proc_device))
                 te /= te.norm(dim=-1, keepdim=True)
             txt_embs.append(te.cpu().numpy().flatten())
-            
-            # Update Progress
-            if (i+1) % 10 == 0 or (i+1) == total:
+
+            if (i + 1) % 10 == 0 or (i + 1) == total:
                 elapsed = time.time() - start_time
-                fps = (i+1) / elapsed
-                eta = (total - (i+1)) / fps
-                progress((i+1)/total, desc=f"분석 중... {i+1}/{total}")
-                yield log(f"   ▶ [{i+1}/{total}] {fps:.1f} FPS (남은 시간: {eta:.0f}초)"), None
+                fps = (i + 1) / elapsed
+                eta = (total - (i + 1)) / fps if fps > 0 else 0
+                progress((i + 1) / total, desc=f"Analyzing... {i+1}/{total}")
+                yield log(f"   ▶ [{i+1}/{total}] {fps:.1f} FPS (ETA: {eta:.0f}s)"), None
 
         # 5. Save Data
-        yield log("💾 데이터 저장 중..."), None
-        
-        # Save Embeddings
+        yield log("💾 Saving data..."), None
+
         np.savez(
-            EMBEDDINGS_FILE,
+            paths['embeddings'],
             image_embeddings=np.array(img_embs),
             text_embeddings=np.array(txt_embs),
             timestamps=np.array([f['timestamp'] for f in frames_data])
         )
-        
-        # Save Metadata
+
         metadata = {
-            "video_info": {"filename": Path(video_path).name},
+            "video_info": {"filename": video_path.name, "movie_name": movie_name},
             "extraction_config": {"method": "scene_detection", "threshold": scene_threshold},
             "total_frames": total,
             "frames": frames_data
         }
-        with open(METADATA_FILE, 'w', encoding='utf-8') as f:
+        with open(paths['metadata'], 'w', encoding='utf-8') as f:
             json.dump(metadata, f, indent=2, ensure_ascii=False)
-            
-        yield log("✨ 모든 작업 완료! 검색 탭으로 이동하세요."), None
-        
-        # Reload Resources
-        load_resources()
-        
+
+        yield log(f"✨ Done! '{movie_name}' is ready for search."), None
+
         # Show Samples
         samples = []
-        for idx in [0, total//2, total-1]:
+        for idx in [0, total // 2, total - 1]:
             if idx < total:
                 f = frames_data[idx]
-                samples.append((str(FRAMES_DIR / f['filename']), f"[{f['time_str']}] {f['caption']}"))
-        
+                samples.append((str(frames_dir / f['filename']), f"[{f['time_str']}] {f['caption']}"))
+
         yield log(""), samples
 
     except Exception as e:
         import traceback
         err = traceback.format_exc()
-        yield log(f"❌ 치명적 오류 발생:\n{err}"), None
+        yield log(f"❌ Error:\n{err}"), None
 
 # ============================================================ 
 # UI BUILDER
@@ -529,113 +590,237 @@ def create_app():
         border-radius: 12px !important;
     }
     
+    /* Gallery - Disable modal/lightbox on click */
+    .result-gallery .preview,
+    .result-gallery .modal,
+    .result-gallery .backdrop,
+    .result-gallery .fixed {
+        display: none !important;
+    }
+
     /* Footer */
     footer { display: none !important; }
     """
 
+    # JavaScript for video seeking
+    seek_js = """
+    (timestamp) => {
+        if (timestamp === null || timestamp === undefined) return timestamp;
+
+        const video = document.querySelector('#main-player video');
+        if (video) {
+            video.currentTime = timestamp;
+            video.pause();
+        }
+
+        return timestamp;
+    }
+    """
+
     with gr.Blocks(theme=gr.themes.Soft(primary_hue="indigo", radius_size="lg"), css=css, title="SceneSearch") as app:
-        
+
+        # State for timestamps
+        timestamps_state = gr.State([])
+
         with gr.Column(elem_classes="container"):
-            
+
             # Header
             gr.HTML("""
                 <div class="header">
-                    <h1>🎬 SceneSearch</h1>
-                    <p>AI that sees, reads, and understands video moments.</p>
+                    <h1>SceneSearch</h1>
+                    <p>Find any moment with natural language</p>
                 </div>
             """)
-            
+
             with gr.Tabs():
-                
+
                 # ---------------------------------------------------------
-                # TAB 1: SEARCH (First Priority)
+                # TAB 1: SEARCH + PLAYER
                 # ---------------------------------------------------------
-                with gr.Tab("🔍 Search Moments", id="search_tab"):
-                    
+                with gr.Tab("🔍 Search", id="search_tab"):
+
+                    # Movie Selection
+                    with gr.Row():
+                        movie_dropdown = gr.Dropdown(
+                            choices=get_available_movies(),
+                            label="Select Movie",
+                            value=None,
+                            scale=3
+                        )
+                        refresh_btn = gr.Button("🔄", scale=0, min_width=50)
+
+                    # Status message
+                    movie_status = gr.HTML(
+                        value="<p style='text-align:center; color:#718096;'>Select a movie to start</p>"
+                    )
+
+                    # Video Player Section
+                    with gr.Column(elem_classes="player-section"):
+                        video_player = gr.Video(
+                            label=None,
+                            show_label=False,
+                            elem_id="main-player",
+                            height=400,
+                            interactive=False
+                        )
+
+                    # Search Section
                     with gr.Column(elem_classes="search-row"):
-                        # Hero Search Bar
                         query_input = gr.Textbox(
                             show_label=False,
-                            placeholder="Describe the scene you are looking for... (e.g., 'A futuristic laboratory with blue lights', 'Johnny Depp smiling')",
+                            placeholder="Describe the scene... (e.g., 'Johnny Depp smiling', 'explosion scene')",
                             lines=1,
-                            scale=3,
                             elem_classes="search-input",
                             autofocus=True
                         )
-                        
+
                         with gr.Row(equal_height=True):
-                            # Intuitive Controls
                             search_mode = gr.Radio(
-                                choices=["Hybrid (Smart)", "Visual Match (Image)", "Conceptual Match (Caption)"],
-                                value="Hybrid (Smart)",
-                                label="Search Logic",
-                                info="Smart mode balances visuals and captions.",
+                                choices=["Hybrid", "Visual", "Caption"],
+                                value="Hybrid",
+                                label="Mode",
                                 scale=2
                             )
                             top_k = gr.Slider(4, 20, value=8, step=4, label="Results", scale=1)
-                            
                             search_btn = gr.Button("Search", variant="primary", scale=1, elem_classes="primary-btn")
 
-                    # Results Area
-                    stats_output = gr.HTML(label="Status")
+                    # Results
+                    stats_output = gr.HTML()
                     gallery = gr.Gallery(
-                        label="Found Scenes", 
-                        columns=4, 
+                        label="Click a frame to jump to that moment",
+                        columns=4,
                         height="auto",
                         object_fit="cover",
                         elem_classes="result-gallery",
-                        show_label=False
+                        show_label=True,
+                        interactive=False,
+                        preview=False
                     )
-                    
+
                     # Examples
                     gr.Examples(
                         examples=[
-                            ["Johnny Depp face close up"],
-                            ["A computer screen displaying code"],
-                            ["Two people talking in a room"],
-                            ["An explosion or fire"],
-                            ["Outdoor scene with trees"]
+                            ["Johnny Depp face"],
+                            ["computer screen"],
+                            ["two people talking"],
+                            ["explosion or fire"],
+                            ["outdoor trees"]
                         ],
                         inputs=query_input,
-                        label="Try these examples:"
+                        label="Try:"
                     )
+                    
+                    # Hidden component for JS bridge
+                    seek_timestamp = gr.Number(value=-1, visible=False)
 
                 # ---------------------------------------------------------
-                # TAB 2: PROCESSING (Secondary)
+                # TAB 2: PROCESSING
                 # ---------------------------------------------------------
-                with gr.Tab("⚙️ Video Processing", id="process_tab"):
-                    gr.Markdown("### Upload and Process New Videos")
+                with gr.Tab("⚙️ Process Video", id="process_tab"):
+                    gr.Markdown("### Upload and Process Video")
                     with gr.Row():
                         with gr.Column(scale=1):
                             video_input = gr.Video(label="Video File", sources=["upload"])
-                            threshold = gr.Slider(0.1, 0.5, value=0.3, step=0.05, label="Scene Detection Sensitivity", info="Lower = More frames")
-                            process_btn = gr.Button("Start Processing (Extract & Embed)", variant="primary")
-                        
+                            threshold = gr.Slider(0.1, 0.5, value=0.3, step=0.05, label="Scene Sensitivity", info="Lower = More frames")
+                            process_btn = gr.Button("Start Processing", variant="primary")
+
                         with gr.Column(scale=1):
                             log_output = gr.Textbox(
-                                label="Processing Log", 
-                                lines=15, 
+                                label="Log",
+                                lines=15,
                                 elem_classes="log-area",
                                 interactive=False
                             )
-                    
-                    gr.Markdown("### Sample Processed Frames")
+
+                    gr.Markdown("### Sample Frames")
                     sample_output = gr.Gallery(label="", columns=4, height="auto")
 
-        # Event Handlers
+        # ---------------------------------------------------------
+        # EVENT HANDLERS
+        # ---------------------------------------------------------
+
+        # Movie selection -> load video + embeddings
+        def on_movie_select(movie_name):
+            if not movie_name:
+                return None, "<p style='text-align:center; color:#718096;'>Select a movie to start</p>", [], ""
+
+            paths = get_movie_paths(movie_name)
+
+            # Check if processed
+            if not is_movie_processed(movie_name):
+                return (
+                    None,
+                    f"<p style='text-align:center; color:#f6ad55;'>⚠️ '{movie_name}' needs processing. Go to Process Video tab.</p>",
+                    [],
+                    ""
+                )
+
+            # Load embeddings
+            success, msg = load_movie_data(movie_name)
+            if not success:
+                return None, f"<p style='text-align:center; color:#fc8181;'>❌ {msg}</p>", [], ""
+
+            # Return video path and success status
+            video_path = str(paths['video']) if paths['video'].exists() else None
+            status_html = f"<p style='text-align:center; color:#48bb78;'>✓ Loaded: {movie_name} ({len(frames)} frames)</p>"
+
+            return video_path, status_html, [], ""
+
+        movie_dropdown.change(
+            fn=on_movie_select,
+            inputs=[movie_dropdown],
+            outputs=[video_player, movie_status, gallery, stats_output]
+        )
+
+        # Refresh movie list
+        def refresh_movies():
+            movies = get_available_movies()
+            return gr.update(choices=movies)
+
+        refresh_btn.click(
+            fn=refresh_movies,
+            inputs=[],
+            outputs=[movie_dropdown]
+        )
+
+        # Search -> update gallery + timestamps
+        def do_search(query, k, mode):
+            results, stats, ts = search(query, k, mode)
+            return results, stats, ts
+
         search_btn.click(
-            fn=search,
+            fn=do_search,
             inputs=[query_input, top_k, search_mode],
-            outputs=[gallery, stats_output]
+            outputs=[gallery, stats_output, timestamps_state]
         )
         query_input.submit(
-            fn=search,
+            fn=do_search,
             inputs=[query_input, top_k, search_mode],
-            outputs=[gallery, stats_output]
+            outputs=[gallery, stats_output, timestamps_state]
+        )
+
+        # Gallery click -> seek video
+        gallery.select(
+            fn=on_gallery_select,
+            inputs=[timestamps_state],
+            outputs=[seek_timestamp]
         )
         
+        # Trigger seek when timestamp changes
+        seek_timestamp.change(
+            fn=None,
+            inputs=[seek_timestamp],
+            outputs=[],
+            js=seek_js
+        )
+
+        # Process video
+        def do_process(video_file, thresh):
+            for log_msg, samples in process_video(video_file, thresh):
+                yield log_msg, samples
+
         process_btn.click(
-            fn=process_video,
+            fn=do_process,
             inputs=[video_input, threshold],
             outputs=[log_output, sample_output]
         )

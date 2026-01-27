@@ -3,10 +3,19 @@
 *.avi
 *.mkv
 *.mov
+*.wmv
+*.webm
 
-# Output data (large files)
+# Output data (large files) - per-movie folders
+output/*/frames/
+output/*/embeddings.npz
+output/*/metadata.json
+output/*/frame_log.txt
+
+# Legacy output paths (keep for compatibility)
 output/frames/
 output/embeddings.npz
+output/metadata.json
 output/frame_log.txt
 
 # Python
