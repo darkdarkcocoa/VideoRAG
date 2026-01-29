@@ -14,11 +14,17 @@ import re
 import os
 from pathlib import Path
 from PIL import Image
+import google.generativeai as genai
 
 # Paths
 BASE_DIR = Path(__file__).parent
 VIDEO_DIR = BASE_DIR / "video"
 OUTPUT_DIR = BASE_DIR / "output"
+
+# Gemini API Setup
+GEMINI_API_KEY = "AIzaSyD2dGtbciU2dTICdqdLHeXDAhinSDRKhdQ"
+genai.configure(api_key=GEMINI_API_KEY)
+gemini_model = genai.GenerativeModel('gemini-2.5-flash-lite')
 
 # Global variables
 image_embeddings = None
@@ -34,6 +40,37 @@ search_results_timestamps = []  # Store timestamps for gallery clicks
 # ============================================================
 # UTILS
 # ============================================================
+def contains_korean(text):
+    """Check if text contains Korean characters"""
+    return bool(re.search(r'[가-힣]', text))
+
+def translate_to_english(query):
+    """Translate Korean query to English using Gemini for CLIP search
+    Returns: (translated_text, error_message or None)
+    """
+    try:
+        prompt = f"""Translate the following Korean text to English.
+The translation should be optimized for image search (CLIP model).
+Return ONLY the English translation, nothing else.
+Keep it concise and descriptive.
+
+Korean: {query}
+English:"""
+        response = gemini_model.generate_content(prompt)
+        translated = response.text.strip()
+        print(f"[Gemini] '{query}' → '{translated}'")
+        return translated, None
+    except Exception as e:
+        error_msg = str(e)
+        if "429" in error_msg or "quota" in error_msg.lower():
+            error_msg = "API 할당량 초과 (잠시 후 다시 시도)"
+        elif "API_KEY" in error_msg:
+            error_msg = "API 키가 유효하지 않음"
+        else:
+            error_msg = f"번역 실패: {error_msg[:50]}"
+        print(f"[Gemini Error] {e}")
+        return query, error_msg  # Fallback to original + error
+
 def format_time(seconds):
     """Format seconds to HH:MM:SS"""
     h = int(seconds // 3600)
@@ -174,6 +211,27 @@ def search(query: str, top_k: int, search_mode: str):
         search_results_timestamps = []
         return [], "", []
 
+    # 0. Translate Korean to English if needed
+    original_query = query
+    translated_query = None
+    if contains_korean(query):
+        translated_query, translation_error = translate_to_english(query)
+        if translation_error:
+            error_html = f"""
+            <div style="background: linear-gradient(135deg, #5c1a1a 0%, #2d2020 100%); border-radius: 12px; padding: 20px; border: 1px solid #ef4444; text-align: center;">
+                <div style="font-size: 2.5rem; margin-bottom: 12px;">🚫</div>
+                <div style="color: #fca5a5; font-size: 1.1rem; font-weight: 600; margin-bottom: 8px;">번역 실패</div>
+                <div style="color: #f87171; font-size: 0.9rem; margin-bottom: 12px;">{translation_error}</div>
+                <div style="color: #a1a1aa; font-size: 0.8rem; padding: 10px; background: #1f1f1f; border-radius: 8px; font-family: monospace;">
+                    Query: "{original_query}"
+                </div>
+            </div>
+            """
+            search_results_timestamps = []
+            return [], error_html, []
+        else:
+            query = translated_query
+
     # 1. Encode Query
     t0 = time.perf_counter()
     text_tokens = tokenizer([query])
@@ -302,40 +360,96 @@ def search(query: str, top_k: int, search_mode: str):
     for i, (sc, ts) in enumerate(zip(top_scores[:5], timestamps[:5])):
         top_results_html += f'<div style="display:flex; justify-content:space-between; padding:4px 8px; background:#252a34; border-radius:4px; margin-bottom:4px;"><span style="color:#667eea;">#{i+1}</span><span style="color:#a0aec0;">{format_time(ts)}</span><span style="color:#48bb78;">{sc:.3f}</span></div>'
 
+    # Translation info box
+    translation_html = ""
+    if translated_query:
+        translation_html = f"""
+        <div style="background: linear-gradient(135deg, #1e3a5f 0%, #2d3748 100%); border-radius: 12px; padding: 14px 18px; margin-bottom: 16px; border: 1px solid #3b82f6; display: flex; align-items: center; gap: 14px;">
+            <div style="font-size: 1.8rem;">🌐</div>
+            <div style="flex: 1;">
+                <div style="color: #94a3b8; font-size: 0.75rem; margin-bottom: 4px;">Translated for CLIP search</div>
+                <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+                    <span style="color: #e2e8f0; font-size: 1rem;">{original_query}</span>
+                    <span style="color: #3b82f6; font-size: 1.2rem;">→</span>
+                    <span style="color: #60a5fa; font-size: 1.05rem; font-weight: 600;">{translated_query}</span>
+                </div>
+            </div>
+        </div>
+        """
+
     # Visualization HTML
     stats = f"""
+    {translation_html}
+    <style>
+        @keyframes cardSlideIn {{
+            0% {{ opacity: 0; transform: translateY(20px) scale(0.9); }}
+            100% {{ opacity: 1; transform: translateY(0) scale(1); }}
+        }}
+        @keyframes arrowFade {{
+            0% {{ opacity: 0; transform: translateX(-10px); }}
+            100% {{ opacity: 1; transform: translateX(0); }}
+        }}
+        .pipeline-card {{
+            background: #2d3748;
+            padding: 12px 16px;
+            border-radius: 10px;
+            text-align: center;
+            min-width: 100px;
+            opacity: 0;
+            animation: cardSlideIn 0.4s ease-out forwards;
+        }}
+        .pipeline-card.final {{
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }}
+        .pipeline-arrow {{
+            color: #667eea;
+            font-size: 1.2rem;
+            opacity: 0;
+            animation: arrowFade 0.3s ease-out forwards;
+        }}
+        .card-0 {{ animation-delay: 0s; }}
+        .arrow-0 {{ animation-delay: 0.15s; }}
+        .card-1 {{ animation-delay: 0.2s; }}
+        .arrow-1 {{ animation-delay: 0.35s; }}
+        .card-2 {{ animation-delay: 0.4s; }}
+        .arrow-2 {{ animation-delay: 0.55s; }}
+        .card-3 {{ animation-delay: 0.6s; }}
+        .arrow-3 {{ animation-delay: 0.75s; }}
+        .card-4 {{ animation-delay: 0.8s; }}
+    </style>
     <div style="background: linear-gradient(135deg, #1a1d24 0%, #252a34 100%); border-radius: 16px; padding: 20px; border: 1px solid #2d3748; margin-bottom: 20px;">
-        
+
         <div style="text-align: center; margin-bottom: 20px;">
             <span style="font-size: 1.2rem; font-weight: 600; color: #e2e8f0;">🔮 Search Pipeline</span>
         </div>
-        
+
         <div style="display: flex; align-items: center; justify-content: center; gap: 8px; margin-bottom: 24px; flex-wrap: wrap;">
-            <div style="background: #2d3748; padding: 12px 16px; border-radius: 10px; text-align: center; min-width: 100px;">
-                <div style="font-size: 1.5rem;">📝</div>
-                <div style="color: #a0aec0; font-size: 0.75rem; margin-top: 4px;">Query</div>
+            <div class="pipeline-card card-0">
+                <div style="font-size: 1.5rem;">{"🌐" if translated_query else "📝"}</div>
+                <div style="color: #a0aec0; font-size: 0.75rem; margin-top: 4px;">{"Translated" if translated_query else "Query"}</div>
                 <div style="color: #e2e8f0; font-size: 0.85rem; font-weight: 500; margin-top: 2px;">"{query[:15]}{"..." if len(query) > 15 else ""}"</div>
+                {f'<div style="color: #667eea; font-size: 0.65rem; margin-top: 2px;">({original_query[:10]}{"..." if len(original_query) > 10 else ""})</div>' if translated_query else ""}
             </div>
-            <div style="color: #667eea; font-size: 1.2rem;">→</div>
-            <div style="background: #2d3748; padding: 12px 16px; border-radius: 10px; text-align: center; min-width: 100px;">
+            <div class="pipeline-arrow arrow-0">→</div>
+            <div class="pipeline-card card-1">
                 <div style="font-size: 1.5rem;">🧠</div>
                 <div style="color: #a0aec0; font-size: 0.75rem; margin-top: 4px;">CLIP Encode</div>
                 <div style="color: #48bb78; font-size: 0.85rem; font-weight: 500; margin-top: 2px;">{encode_time*1000:.1f}ms</div>
             </div>
-            <div style="color: #667eea; font-size: 1.2rem;">→</div>
-            <div style="background: #2d3748; padding: 12px 16px; border-radius: 10px; text-align: center; min-width: 100px;">
+            <div class="pipeline-arrow arrow-1">→</div>
+            <div class="pipeline-card card-2">
                 <div style="font-size: 1.5rem;">🔢</div>
                 <div style="color: #a0aec0; font-size: 0.75rem; margin-top: 4px;">Cosine Similarity</div>
                 <div style="color: #48bb78; font-size: 0.85rem; font-weight: 500; margin-top: 2px;">{len(frames):,} frames</div>
             </div>
-            <div style="color: #667eea; font-size: 1.2rem;">→</div>
-            <div style="background: #2d3748; padding: 12px 16px; border-radius: 10px; text-align: center; min-width: 100px;">
+            <div class="pipeline-arrow arrow-2">→</div>
+            <div class="pipeline-card card-3">
                 <div style="font-size: 1.5rem;">📊</div>
                 <div style="color: #a0aec0; font-size: 0.75rem; margin-top: 4px;">Rank & Select</div>
                 <div style="color: #48bb78; font-size: 0.85rem; font-weight: 500; margin-top: 2px;">Top {top_k}</div>
             </div>
-            <div style="color: #667eea; font-size: 1.2rem;">→</div>
-            <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 12px 16px; border-radius: 10px; text-align: center; min-width: 100px;">
+            <div class="pipeline-arrow arrow-3">→</div>
+            <div class="pipeline-card card-4 final">
                 <div style="font-size: 1.5rem;">✨</div>
                 <div style="color: rgba(255,255,255,0.8); font-size: 0.75rem; margin-top: 4px;">Results</div>
                 <div style="color: white; font-size: 0.85rem; font-weight: 600; margin-top: 2px;">{len(results)} found</div>
@@ -359,8 +473,18 @@ def search(query: str, top_k: int, search_mode: str):
         
         <div style="display: flex; gap: 20px; flex-wrap: wrap;">
             <div style="flex: 2; min-width: 280px;">
-                <div style="color: #a0aec0; font-size: 0.8rem; margin-bottom: 8px; text-align: center;">
-                    📈 Similarity Timeline (★ = top results, hover for details)
+                <div style="display: flex; align-items: center; justify-content: center; gap: 16px; margin-bottom: 10px; flex-wrap: wrap;">
+                    <span style="color: #a0aec0; font-size: 0.85rem;">📈 Similarity Timeline</span>
+                    <div style="display: flex; align-items: center; gap: 12px; background: #252a34; padding: 6px 12px; border-radius: 20px;">
+                        <div style="display: flex; align-items: center; gap: 4px;">
+                            <span style="display: inline-block; width: 8px; height: 8px; background: #3d4555; border-radius: 50%;"></span>
+                            <span style="color: #718096; font-size: 0.7rem;">All frames</span>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 4px;">
+                            <span style="display: inline-block; width: 10px; height: 10px; background: #667eea; border-radius: 50%; box-shadow: 0 0 6px #667eea;"></span>
+                            <span style="color: #a78bfa; font-size: 0.7rem;">Top results</span>
+                        </div>
+                    </div>
                 </div>
                 <style>
                     .pulse-ring {{ animation: pulse 2s ease-in-out infinite; }}
@@ -574,17 +698,33 @@ def create_app():
         background: #0f1117 !important;
     }
     
+    /* Header Animations */
+    @keyframes fadeIn {
+        from { opacity: 0; }
+        to { opacity: 1; }
+    }
+
     /* Header */
     .header { text-align: center; margin-bottom: 40px; }
-    .header h1 { 
-        font-size: 3em; 
-        font-weight: 800; 
-        margin-bottom: 10px; 
-        background: -webkit-linear-gradient(45deg, #667eea, #764ba2);
+    .header h1 {
+        font-size: 3em;
+        font-weight: 800;
+        margin-bottom: 10px;
+        background: linear-gradient(45deg, #667eea, #764ba2);
         -webkit-background-clip: text;
         -webkit-text-fill-color: transparent;
+        background-clip: text;
+        opacity: 0;
+        animation: fadeIn 1.2s ease forwards;
     }
-    .header p { color: #718096; font-size: 1.2em; font-weight: 400; }
+    .header p {
+        color: #718096;
+        font-size: 1.2em;
+        font-weight: 400;
+        opacity: 0;
+        animation: fadeIn 1s ease forwards;
+        animation-delay: 0.5s;
+    }
     
     /* Search Section */
     .search-row { 
@@ -906,6 +1046,20 @@ def create_app():
             fn=on_movie_select,
             inputs=[movie_dropdown],
             outputs=[video_player, movie_status, gallery, stats_output]
+        ).then(
+            fn=None,
+            inputs=None,
+            outputs=None,
+            js="""
+            () => {
+                setTimeout(() => {
+                    const video = document.querySelector('#main-player video');
+                    if (video && video.src) {
+                        video.play().catch(e => console.log('Autoplay blocked:', e));
+                    }
+                }, 800);
+            }
+            """
         )
 
         # Refresh movie list
