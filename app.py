@@ -22,7 +22,7 @@ VIDEO_DIR = BASE_DIR / "video"
 OUTPUT_DIR = BASE_DIR / "output"
 
 # Gemini API Setup
-GEMINI_API_KEY = "AIzaSyD2dGtbciU2dTICdqdLHeXDAhinSDRKhdQ"
+GEMINI_API_KEY = "AIzaSyDCEmU6ejGudcikRYiLONG06rk09POHHWw"
 genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel('gemini-2.5-flash-lite')
 
@@ -367,7 +367,7 @@ def search(query: str, top_k: int, search_mode: str):
         <div style="background: linear-gradient(135deg, #1e3a5f 0%, #2d3748 100%); border-radius: 12px; padding: 14px 18px; margin-bottom: 16px; border: 1px solid #3b82f6; display: flex; align-items: center; gap: 14px;">
             <div style="font-size: 1.8rem;">🌐</div>
             <div style="flex: 1;">
-                <div style="color: #94a3b8; font-size: 0.75rem; margin-bottom: 4px;">Translated for CLIP search</div>
+                <div style="color: #94a3b8; font-size: 0.75rem; margin-bottom: 4px;">Translated for search</div>
                 <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
                     <span style="color: #e2e8f0; font-size: 1rem;">{original_query}</span>
                     <span style="color: #3b82f6; font-size: 1.2rem;">→</span>
@@ -433,7 +433,7 @@ def search(query: str, top_k: int, search_mode: str):
             <div class="pipeline-arrow arrow-0">→</div>
             <div class="pipeline-card card-1">
                 <div style="font-size: 1.5rem;">🧠</div>
-                <div style="color: #a0aec0; font-size: 0.75rem; margin-top: 4px;">CLIP Encode</div>
+                <div style="color: #a0aec0; font-size: 0.75rem; margin-top: 4px;">Image Encode</div>
                 <div style="color: #48bb78; font-size: 0.85rem; font-weight: 500; margin-top: 2px;">{encode_time*1000:.1f}ms</div>
             </div>
             <div class="pipeline-arrow arrow-1">→</div>
