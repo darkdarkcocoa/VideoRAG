@@ -12,6 +12,7 @@ import subprocess
 import shutil
 import re
 import os
+import threading
 from pathlib import Path
 from PIL import Image
 import google.generativeai as genai
@@ -22,7 +23,7 @@ VIDEO_DIR = BASE_DIR / "video"
 OUTPUT_DIR = BASE_DIR / "output"
 
 # Gemini API Setup
-GEMINI_API_KEY = "AIzaSyDCEmU6ejGudcikRYiLONG06rk09POHHWw"
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel('gemini-2.5-flash-lite')
 
@@ -36,6 +37,8 @@ device = None
 use_hybrid = False
 current_movie = None  # Currently loaded movie name
 search_results_timestamps = []  # Store timestamps for gallery clicks
+stop_event = threading.Event()  # Stop signal for processing
+current_ffmpeg_proc = None  # Reference to running ffmpeg process
 
 # ============================================================
 # UTILS
@@ -83,6 +86,20 @@ def format_time(seconds):
 def get_device():
     return "cuda" if torch.cuda.is_available() else "cpu"
 
+def get_video_duration(video_path):
+    """Get video duration in seconds using ffprobe"""
+    try:
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(video_path)
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        return float(result.stdout.strip())
+    except Exception:
+        return 0
+
 def get_movie_name(video_path):
     """Extract movie name from path (without extension)"""
     return Path(video_path).stem
@@ -124,6 +141,71 @@ def is_movie_processed(movie_name):
     """Check if a movie has been processed (embeddings exist)"""
     paths = get_movie_paths(movie_name)
     return paths['embeddings'].exists() and paths['metadata'].exists()
+
+def get_movie_status_html(movie_name):
+    """Generate HTML status panel for a movie's processing state"""
+    if not movie_name:
+        return '<div style="color:#718096; text-align:center; padding:20px;">Select a movie to view status</div>'
+
+    paths = get_movie_paths(movie_name)
+    video_exists = paths['video'].exists()
+    frames_dir = paths['frames']
+    frames_exist = frames_dir.exists() and any(frames_dir.glob("frame_*.jpg"))
+    frame_count = len(list(frames_dir.glob("frame_*.jpg"))) if frames_exist else 0
+    metadata_exists = paths['metadata'].exists()
+    embeddings_exists = paths['embeddings'].exists()
+
+    # Get file sizes
+    def fmt_size(path):
+        if not path.exists():
+            return ""
+        size = path.stat().st_size
+        if size > 1024 * 1024:
+            return f"{size / 1024 / 1024:.1f} MB"
+        elif size > 1024:
+            return f"{size / 1024:.1f} KB"
+        return f"{size} B"
+
+    # Caption count from metadata
+    caption_count = 0
+    if metadata_exists:
+        try:
+            with open(paths['metadata'], 'r', encoding='utf-8') as f:
+                meta = json.load(f)
+            caption_count = sum(1 for f in meta.get('frames', []) if f.get('caption'))
+        except:
+            pass
+
+    def check_row(label, exists, detail=""):
+        icon = "✅" if exists else "⬜"
+        color = "#48bb78" if exists else "#718096"
+        detail_html = f'<span style="color:#a0aec0; font-size:0.8rem; margin-left:8px;">{detail}</span>' if detail else ""
+        return f'''
+        <div style="display:flex; align-items:center; gap:10px; padding:8px 12px; background:#252a34; border-radius:8px; margin-bottom:6px;">
+            <span style="font-size:1.2rem;">{icon}</span>
+            <span style="color:{color}; font-weight:500;">{label}</span>
+            {detail_html}
+        </div>'''
+
+    rows = []
+    rows.append(check_row("Video File", video_exists, fmt_size(paths['video']) if video_exists else "not found"))
+    rows.append(check_row("Frames Extracted", frames_exist, f"{frame_count} frames" if frames_exist else ""))
+    rows.append(check_row("Metadata", metadata_exists, fmt_size(paths['metadata']) if metadata_exists else ""))
+    rows.append(check_row("Captions", caption_count > 0, f"{caption_count} captions" if caption_count > 0 else ""))
+    rows.append(check_row("Embeddings", embeddings_exists, fmt_size(paths['embeddings']) if embeddings_exists else ""))
+
+    all_done = video_exists and frames_exist and metadata_exists and embeddings_exists and caption_count > 0
+    status_badge = '<span style="background:#48bb78; color:#1a1d24; padding:4px 12px; border-radius:12px; font-weight:600; font-size:0.8rem;">Ready for Search</span>' if all_done else '<span style="background:#f59e0b; color:#1a1d24; padding:4px 12px; border-radius:12px; font-weight:600; font-size:0.8rem;">Needs Processing</span>'
+
+    return f'''
+    <div style="background:#1a1d24; border-radius:12px; padding:16px; border:1px solid #2d3748;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+            <span style="color:#e2e8f0; font-weight:600; font-size:1.1rem;">📁 {movie_name}</span>
+            {status_badge}
+        </div>
+        {"".join(rows)}
+    </div>
+    '''
 
 # ============================================================
 # SEARCH ENGINE
@@ -527,12 +609,105 @@ def on_gallery_select(evt: gr.SelectData, timestamps_state):
 # ============================================================
 # PROCESSING ENGINE
 # ============================================================
-def process_video(video_file, scene_threshold, progress=gr.Progress()):
-    """Full pipeline: Extract -> Caption -> Embed"""
+def make_progress_html(phase, current=0, total=0, fps=0, eta=0, caption=""):
+    """Generate HTML progress bar for processing stages"""
+    hint = ""
+    if phase == "extract":
+        # current=last_pts_time, total=video_duration, eta=frame_count_found
+        pct = (current / total * 100) if total > 0 else 0
+        frame_count = int(eta)
+        status_icon = "🎬"
+        status_text = f"Extracting frames... {frame_count} found"
+        if total > 0 and current > 0:
+            sub_text = f"Scanning video · {format_time(current)} / {format_time(total)}"
+            pulse = False
+        else:
+            sub_text = "Starting ffmpeg scene detection..."
+            pulse = True
+        bar_color = "linear-gradient(90deg, #f59e0b, #d97706)"
+        hint = f"💡 장면 전환(scene change)이 설정값({caption})을 초과하는 순간만 키프레임으로 추출합니다" if caption else "💡 장면 전환(scene change)이 감지된 순간만 키프레임으로 추출합니다"
+    elif phase == "model_load":
+        pct = 0
+        status_icon = "🧠"
+        status_text = "Loading AI models..."
+        sub_text = "CLIP + BLIP (first time may take a minute)"
+        bar_color = "linear-gradient(90deg, #8b5cf6, #6d28d9)"
+        pulse = True
+    elif phase == "analyze":
+        pct = (current / total * 100) if total > 0 else 0
+        status_icon = "⚡"
+        status_text = f"Analyzing frames... {current}/{total}"
+        eta_str = f"{int(eta//60)}분 {int(eta%60)}초" if eta >= 60 else f"{eta:.0f}초"
+        sub_text = f"처리 속도: {fps:.1f} frames/sec · 남은 시간: {eta_str}"
+        if caption:
+            sub_text += f'<br>📝 "{caption[:60]}..."' if len(caption) > 60 else f'<br>📝 "{caption}"'
+        bar_color = "linear-gradient(90deg, #667eea, #764ba2)"
+        pulse = False
+        hint = "💡 CLIP으로 이미지 임베딩, BLIP으로 캡션 생성 후 캡션도 임베딩합니다"
+    elif phase == "save":
+        pct = 100
+        status_icon = "💾"
+        status_text = "Saving data..."
+        sub_text = "Writing embeddings and metadata"
+        bar_color = "linear-gradient(90deg, #10b981, #059669)"
+        pulse = False
+    elif phase == "done":
+        pct = 100
+        status_icon = "✅"
+        status_text = f"Complete! {total} frames processed"
+        sub_text = "Ready for search"
+        bar_color = "linear-gradient(90deg, #10b981, #059669)"
+        pulse = False
+    elif phase == "stopped":
+        pct = (current / total * 100) if total > 0 else 0
+        status_icon = "⛔"
+        status_text = "Stopped by user"
+        sub_text = f"{int(eta)} frames extracted before stop" if eta > 0 else "Processing cancelled"
+        bar_color = "linear-gradient(90deg, #ef4444, #b91c1c)"
+        pulse = False
+    else:
+        return ""
+
+    pulse_css = """
+        @keyframes barPulse {
+            0%, 100% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+        }
+    """ if pulse else ""
+    pulse_style = "background-size: 200% 100%; animation: barPulse 2s ease-in-out infinite;" if pulse else ""
+    bar_width = "100%" if pulse else f"{pct}%"
+    pct_display = f'<div style="color: #667eea; font-size: 1.3rem; font-weight: 700;">{pct:.1f}%</div>' if not pulse else ""
+
+    return f"""
+    <style>{pulse_css}</style>
+    <div style="background: #1a1d24; border-radius: 16px; padding: 24px; border: 1px solid #2d3748;">
+        <div style="display: flex; align-items: center; gap: 16px; margin-bottom: 16px;">
+            <div style="font-size: 2rem;">{status_icon}</div>
+            <div style="flex: 1;">
+                <div style="color: #e2e8f0; font-size: 1.1rem; font-weight: 600;">{status_text}</div>
+                <div style="color: #718096; font-size: 0.85rem; margin-top: 2px;">{sub_text}</div>
+            </div>
+            {pct_display}
+        </div>
+        <div style="background: #2d3748; border-radius: 8px; height: 12px; overflow: hidden;">
+            <div style="background: {bar_color}; height: 100%; border-radius: 8px; width: {bar_width}; transition: width 0.3s ease; {pulse_style}"></div>
+        </div>
+        {f'<div style="color:#5a6577; font-size:0.75rem; margin-top:10px; text-align:center;">{hint}</div>' if hint else ''}
+    </div>
+    """
+
+
+def process_video(video_file, scene_threshold):
+    """Full pipeline: Extract -> Caption -> Embed
+    Yields: (log_text, progress_html, sample_gallery)
+    """
+    global current_ffmpeg_proc
 
     if video_file is None:
-        yield "❌ 영상 파일을 선택해주세요.", None
+        yield "❌ 영상 파일을 선택해주세요.", "", None
         return
+
+    stop_event.clear()
 
     video_path = Path(video_file)
     movie_name = video_path.stem
@@ -548,15 +723,24 @@ def process_video(video_file, scene_threshold, progress=gr.Progress()):
         return "\n".join(log_messages)
 
     try:
-        # 1. Init
-        yield log(f"🚀 Processing: {movie_name}"), None
+        # 1. Init - Copy to video/ folder if uploaded from elsewhere
+        yield log(f"🚀 Processing: {movie_name}"), "", None
+
+        VIDEO_DIR.mkdir(parents=True, exist_ok=True)
+        dest_video = VIDEO_DIR / video_path.name
+        if not dest_video.exists() or dest_video.resolve() != video_path.resolve():
+            yield log(f"📁 Copying video to video/ folder..."), "", None
+            shutil.copy2(str(video_path), str(dest_video))
+            yield log(f"✅ Saved: {dest_video.name}"), "", None
         if frames_dir.exists():
             shutil.rmtree(frames_dir)
         frames_dir.mkdir(parents=True, exist_ok=True)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # 2. FFmpeg Extraction
-        yield log(f"🎬 Scene detection (threshold: {scene_threshold})"), None
+        # 2. FFmpeg Extraction (with live progress)
+        video_duration = get_video_duration(video_path)
+        duration_str = format_time(video_duration) if video_duration > 0 else "unknown"
+        yield log(f"🎬 Scene detection (threshold: {scene_threshold}) · Duration: {duration_str}"), make_progress_html("extract", 0, video_duration, 0, 0, str(scene_threshold)), None
 
         cmd = [
             "ffmpeg", "-y", "-i", str(video_path),
@@ -568,20 +752,36 @@ def process_video(video_file, scene_threshold, progress=gr.Progress()):
         proc = subprocess.Popen(
             cmd, stderr=subprocess.PIPE, universal_newlines=True, encoding='utf-8', errors='replace'
         )
+        current_ffmpeg_proc = proc
         pts_times = []
+        last_update = time.time()
         for line in proc.stderr:
+            if stop_event.is_set():
+                proc.terminate()
+                proc.wait()
+                current_ffmpeg_proc = None
+                last_pts = pts_times[-1] if pts_times else 0
+                yield log("⛔ Stopped by user."), make_progress_html("stopped", last_pts, video_duration, 0, len(pts_times)), None
+                return
             if "pts_time:" in line:
                 match = re.search(r'pts_time:(\d+\.?\d*)', line)
                 if match:
                     pts_times.append(float(match.group(1)))
+                    # Update UI every 2 seconds
+                    now = time.time()
+                    if now - last_update > 2:
+                        last_update = now
+                        last_pts = pts_times[-1]
+                        yield log(f"   ▶ Extracting... {len(pts_times)} frames ({format_time(last_pts)})"), make_progress_html("extract", last_pts, video_duration, 0, len(pts_times), str(scene_threshold)), None
         proc.wait()
+        current_ffmpeg_proc = None
 
         frame_files = list(frames_dir.glob("frame_*.jpg"))
         if not frame_files:
-            yield log("❌ No frames extracted. Try lowering the threshold."), None
+            yield log("❌ No frames extracted. Try lowering the threshold."), "", None
             return
 
-        yield log(f"✅ Extracted {len(frame_files)} frames"), None
+        yield log(f"✅ Extracted {len(frame_files)} frames"), make_progress_html("extract", video_duration, video_duration, 0, len(frame_files), str(scene_threshold)), None
 
         # 3. Metadata Structure
         frames_data = []
@@ -596,7 +796,7 @@ def process_video(video_file, scene_threshold, progress=gr.Progress()):
             })
 
         # 4. AI Processing (CLIP + BLIP)
-        yield log("🧠 Loading AI models..."), None
+        yield log("🧠 Loading AI models..."), make_progress_html("model_load"), None
 
         proc_device = get_device()
 
@@ -608,7 +808,7 @@ def process_video(video_file, scene_threshold, progress=gr.Progress()):
         b_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-large")
         b_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-large").to(proc_device).eval()
 
-        yield log("✅ Models loaded. Analyzing frames..."), None
+        yield log("✅ Models loaded. Analyzing frames..."), make_progress_html("analyze", 0, len(frames_data)), None
 
         img_embs = []
         txt_embs = []
@@ -617,6 +817,10 @@ def process_video(video_file, scene_threshold, progress=gr.Progress()):
         total = len(frames_data)
 
         for i, frame_info in enumerate(frames_data):
+            if stop_event.is_set():
+                yield log(f"⛔ Stopped by user. ({i}/{total} frames processed)"), make_progress_html("stopped", i, total, 0, i), None
+                return
+
             f_path = frames_dir / frame_info['filename']
             image = Image.open(f_path).convert('RGB')
 
@@ -641,15 +845,14 @@ def process_video(video_file, scene_threshold, progress=gr.Progress()):
                 te /= te.norm(dim=-1, keepdim=True)
             txt_embs.append(te.cpu().numpy().flatten())
 
-            if (i + 1) % 10 == 0 or (i + 1) == total:
+            if (i + 1) % 5 == 0 or (i + 1) == total:
                 elapsed = time.time() - start_time
                 fps = (i + 1) / elapsed
                 eta = (total - (i + 1)) / fps if fps > 0 else 0
-                progress((i + 1) / total, desc=f"Analyzing... {i+1}/{total}")
-                yield log(f"   ▶ [{i+1}/{total}] {fps:.1f} FPS (ETA: {eta:.0f}s)"), None
+                yield log(f"   ▶ [{i+1}/{total}] {fps:.1f} FPS (ETA: {eta:.0f}s)"), make_progress_html("analyze", i + 1, total, fps, eta, caption), None
 
         # 5. Save Data
-        yield log("💾 Saving data..."), None
+        yield log("💾 Saving data..."), make_progress_html("save"), None
 
         np.savez(
             paths['embeddings'],
@@ -667,7 +870,7 @@ def process_video(video_file, scene_threshold, progress=gr.Progress()):
         with open(paths['metadata'], 'w', encoding='utf-8') as f:
             json.dump(metadata, f, indent=2, ensure_ascii=False)
 
-        yield log(f"✨ Done! '{movie_name}' is ready for search."), None
+        yield log(f"✨ Done! '{movie_name}' is ready for search."), make_progress_html("done", total=total), None
 
         # Show Samples
         samples = []
@@ -676,12 +879,12 @@ def process_video(video_file, scene_threshold, progress=gr.Progress()):
                 f = frames_data[idx]
                 samples.append((str(frames_dir / f['filename']), f"[{f['time_str']}] {f['caption']}"))
 
-        yield log(""), samples
+        yield log(""), make_progress_html("done", total=total), samples
 
     except Exception as e:
         import traceback
         err = traceback.format_exc()
-        yield log(f"❌ Error:\n{err}"), None
+        yield log(f"❌ Error:\n{err}"), make_progress_html("stopped", 0, 0, 0, 0), None
 
 # ============================================================ 
 # UI BUILDER
@@ -691,7 +894,7 @@ def create_app():
     # Custom CSS
     css = """
     /* Main Layout */
-    .container { max-width: 1200px; margin: auto; padding-top: 30px; }
+    .container { max-width: 1200px; margin: auto; padding-top: 0px; }
     
     /* Dark Theme Base */
     .gradio-container {
@@ -826,6 +1029,12 @@ def create_app():
     }
     
     /* Logs */
+    .log-area {
+        padding: 8px !important;
+        display: flex !important;
+        flex-direction: column !important;
+        justify-content: center !important;
+    }
     .log-area textarea { 
         font-family: 'Consolas', 'Monaco', monospace;
         font-size: 13px;
@@ -834,6 +1043,8 @@ def create_app():
         border-radius: 12px;
         border: 1px solid #2d3748 !important;
         line-height: 1.5;
+        min-height: 240px !important;
+        width: 100% !important;
     }
     
     /* Examples */
@@ -876,6 +1087,29 @@ def create_app():
 
     /* Footer */
     footer { display: none !important; }
+    
+    /* Compact file upload area text */
+    .compact-upload * {
+        font-size: 0.8rem !important;
+    }
+    .compact-upload label span {
+        font-size: 0.85rem !important;
+    }
+    
+    /* Remove hide-container extra padding from section headers */
+    .section-header {
+        padding: 0 !important;
+        margin: 0 !important;
+        min-height: 0 !important;
+        height: 20px !important;
+        border-width: 0 !important;
+        overflow: visible !important;
+    }
+    .section-header h4 {
+        margin: 0 !important;
+        padding: 0 !important;
+    }
+    
     """
 
     # JavaScript for video seeking
@@ -993,23 +1227,78 @@ def create_app():
                 # TAB 2: PROCESSING
                 # ---------------------------------------------------------
                 with gr.Tab("⚙️ Process Video", id="process_tab"):
-                    gr.Markdown("### Upload and Process Video")
-                    with gr.Row():
-                        with gr.Column(scale=1):
-                            video_input = gr.Video(label="Video File", sources=["upload"])
-                            threshold = gr.Slider(0.1, 0.5, value=0.3, step=0.05, label="Scene Sensitivity", info="Lower = More frames")
-                            process_btn = gr.Button("Start Processing", variant="primary")
 
-                        with gr.Column(scale=1):
-                            log_output = gr.Textbox(
-                                label="Log",
-                                lines=15,
-                                elem_classes="log-area",
-                                interactive=False
+                    # Row 1: Video Source | Progress
+                    with gr.Row(equal_height=True):
+                        with gr.Column(scale=1, min_width=400):
+                            gr.Markdown("#### 🎬 Video Source")
+                            with gr.Group(elem_classes="video-source-group"):
+                                process_dropdown = gr.Dropdown(
+                                    choices=get_available_movies(),
+                                    label="Select from video/ folder",
+                                    value=None,
+                                )
+                                video_input = gr.File(
+                                    label="Or upload new video",
+                                    file_types=["video"],
+                                    height=100,
+                                    elem_classes="compact-upload",
+                                )
+                        with gr.Column(scale=1, min_width=400):
+                            gr.Markdown("#### 📊 Progress", elem_classes="section-header")
+                            progress_output = gr.HTML(
+                                value='<div style="background:#1a1d24; border-radius:12px; padding:40px; border:1px solid #2d3748; text-align:center; color:#718096; display:flex; align-items:center; justify-content:center;">Waiting to start...</div>'
                             )
 
-                    gr.Markdown("### Sample Frames")
-                    sample_output = gr.Gallery(label="", columns=4, height="auto")
+                    # Row 2: Settings | Log
+                    with gr.Row(equal_height=True):
+                        with gr.Column(scale=1, min_width=400):
+                            gr.Markdown("#### ⚙️ Settings", elem_classes="section-header")
+                            threshold = gr.Slider(
+                                0.1, 0.5, value=0.3, step=0.05,
+                                label="Scene Sensitivity",
+                                info="ffmpeg의 scene change detection 임계값"
+                            )
+                            gr.HTML('''<div style="color:#8a94a6; font-size:0.72rem; line-height:1.5; padding:0px 4px; margin-top:-6px;">
+                                <div style="margin-bottom:3px;">영상의 연속된 두 프레임 간 <b style="color:#a0aec0;">픽셀 변화량(0~1)</b>을 비교해서, 이 값을 초과하면 "장면이 바뀌었다"고 판단하여 해당 프레임을 추출합니다.</div>
+                                <div style="display:flex; gap:12px; flex-wrap:wrap;">
+                                    <span>🔹 <b style="color:#f59e0b;">0.1</b> 민감 (프레임 많음)</span>
+                                    <span>🔹 <b style="color:#48bb78;">0.3</b> 권장</span>
+                                    <span>🔹 <b style="color:#667eea;">0.5</b> 둔감 (프레임 적음)</span>
+                                </div>
+                            </div>''')
+                            with gr.Row():
+                                process_btn = gr.Button("▶ Start Processing", variant="primary", scale=3)
+                                stop_btn = gr.Button("■ Stop", variant="stop", scale=1, visible=False)
+                                process_refresh_btn = gr.Button("🔄", scale=0, min_width=40)
+                        with gr.Column(scale=1, min_width=400):
+                            gr.Markdown("#### 📋 Log", elem_classes="section-header")
+                            log_output = gr.Textbox(
+                                show_label=False,
+                                max_lines=8,
+                                elem_classes="log-area",
+                                interactive=False,
+                                autoscroll=True
+                            )
+
+                    # Sample Frames (full width)
+                    sample_output = gr.Gallery(label="Sample Frames", columns=4, height="auto")
+
+                    # Manage Section
+                    gr.Markdown("---")
+                    gr.Markdown("#### 📁 Manage Processed Movies")
+                    with gr.Row():
+                        manage_dropdown = gr.Dropdown(
+                            choices=get_available_movies(),
+                            label="Select Movie",
+                            value=None,
+                            scale=4
+                        )
+                        manage_refresh_btn = gr.Button("🔄 Refresh", scale=0, min_width=100)
+                        delete_btn = gr.Button("🗑️ Delete", variant="stop", scale=0, min_width=100)
+                    movie_status_html = gr.HTML(
+                        value='<div style="color:#718096; text-align:center; padding:16px;">Select a movie to view status</div>'
+                    )
 
         # ---------------------------------------------------------
         # EVENT HANDLERS
@@ -1105,14 +1394,104 @@ def create_app():
         )
 
         # Process video
-        def do_process(video_file, thresh):
-            for log_msg, samples in process_video(video_file, thresh):
-                yield log_msg, samples
+        def do_process(selected_movie, uploaded_file, thresh):
+            # Determine video path: dropdown takes priority, then upload
+            video_path = None
+            if selected_movie:
+                paths = get_movie_paths(selected_movie)
+                video_path = str(paths['video'])
+            elif uploaded_file:
+                video_path = uploaded_file  # gr.File returns path string
+            
+            for log_msg, prog_html, samples in process_video(video_path, thresh):
+                yield log_msg, prog_html, samples
 
-        process_btn.click(
+        def on_process_start():
+            """Show stop button, hide start button"""
+            return gr.update(visible=False), gr.update(visible=True)
+
+        def on_process_end():
+            """Show start button, hide stop button, refresh dropdowns"""
+            movies = get_available_movies()
+            return (
+                gr.update(visible=True),
+                gr.update(visible=False, interactive=True, value="■ Stop"),
+                gr.update(choices=movies),
+                gr.update(choices=movies),
+            )
+
+        def on_stop_click():
+            """Signal processing to stop"""
+            stop_event.set()
+            if current_ffmpeg_proc and current_ffmpeg_proc.poll() is None:
+                current_ffmpeg_proc.terminate()
+            return gr.update(interactive=False, value="■ Stopping...")
+
+        def on_process_refresh():
+            return gr.update(choices=get_available_movies())
+
+        process_refresh_btn.click(
+            fn=on_process_refresh,
+            inputs=[],
+            outputs=[process_dropdown]
+        )
+
+        process_click_event = process_btn.click(
+            fn=on_process_start,
+            inputs=[],
+            outputs=[process_btn, stop_btn]
+        ).then(
             fn=do_process,
-            inputs=[video_input, threshold],
-            outputs=[log_output, sample_output]
+            inputs=[process_dropdown, video_input, threshold],
+            outputs=[log_output, progress_output, sample_output]
+        ).then(
+            fn=on_process_end,
+            inputs=[],
+            outputs=[process_btn, stop_btn, process_dropdown, manage_dropdown]
+        )
+
+        stop_btn.click(
+            fn=on_stop_click,
+            inputs=[],
+            outputs=[stop_btn],
+            cancels=[process_click_event]
+        ).then(
+            fn=on_process_end,
+            inputs=[],
+            outputs=[process_btn, stop_btn, process_dropdown, manage_dropdown]
+        )
+
+        # Manage section handlers
+        def on_manage_select(movie_name):
+            return get_movie_status_html(movie_name)
+
+        def on_manage_refresh():
+            movies = get_available_movies()
+            return gr.update(choices=movies)
+
+        def delete_movie_data(movie_name):
+            if not movie_name:
+                return get_movie_status_html(None), gr.update(choices=get_available_movies())
+            paths = get_movie_paths(movie_name)
+            output_dir = paths['output_dir']
+            if output_dir.exists():
+                shutil.rmtree(output_dir)
+            return get_movie_status_html(movie_name), gr.update(choices=get_available_movies())
+
+        manage_dropdown.change(
+            fn=on_manage_select,
+            inputs=[manage_dropdown],
+            outputs=[movie_status_html]
+        )
+        manage_refresh_btn.click(
+            fn=on_manage_refresh,
+            inputs=[],
+            outputs=[manage_dropdown]
+        )
+        delete_btn.click(
+            fn=delete_movie_data,
+            inputs=[manage_dropdown],
+            outputs=[movie_status_html, manage_dropdown]
         )
 
     return app

@@ -40,3 +40,4 @@ temp/
 # Misc
 nul
 *_backup.py
+.env

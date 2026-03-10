@@ -34,7 +34,27 @@
       "Bash(findstr:*)",
       "Bash(taskkill:*)",
       "Bash(cmd //c \"taskkill /PID 11272 /F\")",
-      "Bash(tree:*)"
+      "Bash(tree:*)",
+      "Bash(cd:*)",
+      "Bash(git -C D:/X/VideoRAG log --oneline -15)",
+      "Bash(git -C D:/X/VideoRAG log --pretty=format:\"%h | %s | %ar\" -15)",
+      "Bash(git -C D:/X/VideoRAG show --stat 2222c60)",
+      "Bash(find:*)",
+      "Bash(du -sh:*)",
+      "Bash(timeout:*)",
+      "Bash(pip install:*)",
+      "Bash(grep:*)",
+      "Bash(pkill:*)",
+      "Bash(git -C D:/X/VideoRAG log --oneline -20)",
+      "Bash(git fetch:*)",
+      "Bash(gh repo view:*)",
+      "WebFetch(domain:github.com)",
+      "Bash(git -C D:/X/VideoRAG remote -v)",
+      "Bash(git -C D:/X/VideoRAG fetch origin)",
+      "Bash(git -C D:/X/VideoRAG log --oneline origin/main..HEAD)",
+      "Bash(git -C D:/X/VideoRAG log --oneline HEAD..origin/main)",
+      "Bash(git:*)",
+      "Bash(xargs wc:*)"
     ]
   }
 }
